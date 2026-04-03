@@ -95,10 +95,6 @@ typedef ptrdiff_t isize;
 #define CPP_VERSION 0
 #endif
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 // ---------------------- Отдельная функция для ошибок ----------------------
 NORETURN inline void fatal_alloc_error(usize size) {
     fprintf(stderr, "aligned_malloc failed for size %zu\n", size);
@@ -140,181 +136,157 @@ FORCE_INLINE void aligned_free(void *ptr) {
 #endif
 }
 
-#ifdef __cplusplus
+// ---------------------- Потоки, Mutex, Once, Barrier ----------------------
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <unistd.h>
+#include <stdatomic.h>
+#endif
+
+// -------- Потоки --------
+typedef
+#ifdef _WIN32
+    HANDLE
+#else
+    pthread_t
+#endif
+Thread;
+
+typedef void* (*ThreadFunc)(void*);
+
+FORCE_INLINE int thread_create(Thread* t, ThreadFunc func, void* arg) {
+#ifdef _WIN32
+    *t = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)func, arg, 0, NULL);
+    return *t == NULL ? -1 : 0;
+#else
+    return pthread_create(t, NULL, func, arg);
+#endif
+}
+
+FORCE_INLINE int thread_join(Thread t) {
+#ifdef _WIN32
+    WaitForSingleObject(t, INFINITE);
+    CloseHandle(t);
+    return 0;
+#else
+    return pthread_join(t, NULL);
+#endif
+}
+
+// ---------------------- Once wrapper ----------------------
+#ifdef _WIN32
+#include <windows.h>
+
+typedef INIT_ONCE Once;
+#define ONCE_INIT INIT_ONCE_STATIC_INIT
+
+// Обёртка, чтобы можно было передавать void func(void)
+typedef void (*once_func_t)(void);
+
+static BOOL CALLBACK once_trampoline(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context) {
+    once_func_t func = (once_func_t)Parameter;
+    func();
+    return TRUE;
+}
+
+static FORCE_INLINE int once_execute(Once* once, once_func_t func) {
+    return InitOnceExecuteOnce(once, once_trampoline, (PVOID)func, NULL) ? 0 : -1;
+}
+
+#else
+#include <pthread.h>
+
+typedef pthread_once_t Once;
+#define ONCE_INIT PTHREAD_ONCE_INIT
+
+FORCE_INLINE int once_execute(Once* once, void (*func)(void)) {
+    return pthread_once(once, func);
+}
+
+#endif
+
+// -------- Barrier --------
+#ifdef _WIN32
+typedef struct {
+    int count;
+    int waiting;
+    CRITICAL_SECTION cs;
+    CONDITION_VARIABLE cv;
+} Barrier;
+
+FORCE_INLINE int barrier_init(Barrier* b, int count) {
+    b->count = count;
+    b->waiting = 0;
+    InitializeCriticalSection(&b->cs);
+    InitializeConditionVariable(&b->cv);
+    return 0;
+}
+
+FORCE_INLINE int barrier_wait(Barrier* b) {
+    EnterCriticalSection(&b->cs);
+    b->waiting++;
+    if (b->waiting >= b->count) {
+        b->waiting = 0;
+        WakeAllConditionVariable(&b->cv);
+    } else {
+        SleepConditionVariableCS(&b->cv, &b->cs, INFINITE);
+    }
+    LeaveCriticalSection(&b->cs);
+    return 0;
+}
+
+FORCE_INLINE int barrier_destroy(Barrier* b) {
+    DeleteCriticalSection(&b->cs);
+    return 0;
+}
+
+#else
+typedef pthread_barrier_t Barrier;
+
+FORCE_INLINE int barrier_init(Barrier* b, int count) {
+    return pthread_barrier_init(b, NULL, count);
+}
+
+FORCE_INLINE int barrier_wait(Barrier* b) {
+    return pthread_barrier_wait(b);
+}
+
+FORCE_INLINE int barrier_destroy(Barrier* b) {
+    return pthread_barrier_destroy(b);
 }
 #endif
 
-#ifdef __cplusplus
-// ---------------------- Concept Allocator
+// -------- Mutex --------
+#ifdef _WIN32
+typedef CRITICAL_SECTION Mutex;
+FORCE_INLINE void mutex_init(Mutex* m) { InitializeCriticalSection(m); }
+FORCE_INLINE void mutex_lock(Mutex* m) { EnterCriticalSection(m); }
+FORCE_INLINE void mutex_unlock(Mutex* m) { LeaveCriticalSection(m); }
+FORCE_INLINE void mutex_destroy(Mutex* m) { DeleteCriticalSection(m); }
+#else
+typedef pthread_mutex_t Mutex;
+FORCE_INLINE void mutex_init(Mutex* m) { pthread_mutex_init(m, NULL); }
+FORCE_INLINE void mutex_lock(Mutex* m) { pthread_mutex_lock(m); }
+FORCE_INLINE void mutex_unlock(Mutex* m) { pthread_mutex_unlock(m); }
+FORCE_INLINE void mutex_destroy(Mutex* m) { pthread_mutex_destroy(m); }
+#endif
 
-// Проверяем метод alloc(std::size_t) -> void*
-template <typename T>
-concept Allocatable = requires(T t, std::size_t n) {
-    { t.alloc(n) } -> std::same_as<void *>;
-};
-
-// Проверяем метод dealloc(void*) -> void
-template <typename T>
-concept Deallocatable = requires(T t, void *p) {
-    { t.dealloc(p) } -> std::same_as<void>;
-};
-
-// Проверяем метод reset() -> void
-template <typename T>
-concept Resetable = requires(T t) {
-    { t.reset() } -> std::same_as<void>;
-};
-
-// Проверяем метод calloc(std::size_t, std::size_t) -> void*
-template <typename T>
-concept Calocable = requires(T t, std::size_t count, std::size_t size) {
-    { t.calloc(count, size) } -> std::same_as<void *>;
-};
-
-// ---------------------- С++ Default Allocator -----------------------
-
-// Функция для alloc
-template <Allocatable T> void *alloc(T &allocator, std::size_t n) {
-    return allocator.alloc(n);
+// -------- Атомарные операции --------
+#ifdef _WIN32
+FORCE_INLINE long atomic_increment(volatile long* a) { return InterlockedIncrement(a); }
+FORCE_INLINE long atomic_decrement(volatile long* a) { return InterlockedDecrement(a); }
+FORCE_INLINE long atomic_add(volatile long* a, long val) { return InterlockedExchangeAdd(a, val); }
+FORCE_INLINE long atomic_cas(volatile long* a, long expected, long desired) { return InterlockedCompareExchange(a, desired, expected); }
+#else
+FORCE_INLINE int atomic_increment(volatile int* a) { return atomic_fetch_add(a, 1) + 1; }
+FORCE_INLINE int atomic_decrement(volatile int* a) { return atomic_fetch_sub(a, 1) - 1; }
+FORCE_INLINE int atomic_add(volatile int* a, int val) { return atomic_fetch_add(a, val); }
+FORCE_INLINE int atomic_cas(volatile int* a, int expected, int desired) { 
+    atomic_compare_exchange_strong(a, &expected, desired);
+    return expected;
 }
-
-// Функция для dealloc
-template <Deallocatable T> void dealloc(T &allocator, void *ptr) {
-    allocator.dealloc(ptr);
-}
-
-// Функция для reset
-template <Resetable T> void reset(T &allocator) { allocator.reset(); }
-
-// Функция для calloc
-template <Calocable T>
-void *alloc_zeroed(T &allocator, std::size_t count, std::size_t size) {
-    return allocator.calloc(count, size);
-}
-
-// ---------------------- C++ Arena -----------------------------
-
-struct ArenaAllocator {
-    u8 *buffer;
-    usize capacity;
-    usize offset;
-
-    ArenaAllocator(usize size) : capacity(size), offset(0) {
-        buffer =
-            static_cast<u8 *>(aligned_malloc(size, alignof(std::max_align_t)));
-    }
-
-    ~ArenaAllocator() { aligned_free(buffer); }
-
-    void *alloc(usize n, usize alignment = alignof(std::max_align_t)) {
-        usize current = reinterpret_cast<usize>(buffer + offset);
-        usize aligned = (current + alignment - 1) & ~(alignment - 1);
-
-        usize new_offset = aligned - reinterpret_cast<usize>(buffer) + n;
-
-        if (new_offset > capacity)
-            return nullptr;
-
-        offset = new_offset;
-        return reinterpret_cast<void *>(aligned);
-    }
-
-    void reset() { offset = 0; }
-
-    void *calloc(usize count, usize size) {
-        if (size != 0 && count > SIZE_MAX / size)
-            return nullptr;
-
-        usize total = count * size;
-        void *ptr = alloc(total);
-
-        if (ptr) {
-            std::memset(ptr, 0, total);
-        }
-        return ptr;
-    }
-};
-
-// ---------------------- C++ Pool -----------------------------
-
-struct PoolAllocator {
-    struct Block {
-        Block *next;
-    };
-
-    u8 *buffer;
-    Block *free_list;
-    usize block_size;
-    usize capacity;
-
-    PoolAllocator(usize count, usize size)
-        : block_size(size < sizeof(Block) ? sizeof(Block) : size),
-          capacity(count) {
-        buffer =
-            (u8 *)aligned_malloc(block_size * count, alignof(std::max_align_t));
-
-        // строим free list
-        free_list = nullptr;
-
-        for (usize i = 0; i < count; ++i) {
-            Block *block = (Block *)(buffer + i * block_size);
-            block->next = free_list;
-            free_list = block;
-        }
-    }
-
-    ~PoolAllocator() { aligned_free(buffer); }
-
-    void *alloc() {
-        if (!free_list)
-            return nullptr;
-
-        Block *b = free_list;
-        free_list = b->next;
-        return b;
-    }
-
-    void dealloc(void *ptr) {
-        Block *b = (Block *)ptr;
-        b->next = free_list;
-        free_list = b;
-    }
-
-    void reset() {
-        free_list = nullptr;
-
-        for (usize i = 0; i < capacity; ++i) {
-            Block *block = (Block *)(buffer + i * block_size);
-            block->next = free_list;
-            free_list = block;
-        }
-    }
-};
-
-template <typename T, typename... Args>
-T* pool_create(PoolAllocator& pool, Args&&... args) {
-    void* mem = pool.alloc();
-    if (!mem) return nullptr;
-    return new (mem) T(std::forward<Args>(args)...);
-}
-
-template <typename T>
-void pool_destroy(PoolAllocator& pool, T* obj) {
-    if (!obj) return;
-    obj->~T();
-    pool.dealloc(obj);
-}
-
-// ---------------------- C++ шаблон для типизированных массивов
-template <typename T>
-FORCE_INLINE T *aligned_malloc_array(usize count, usize alignment) {
-    return static_cast<T *>(aligned_malloc(sizeof(T) * count, alignment));
-}
-
-template <typename T> FORCE_INLINE void aligned_free_array(T *ptr) {
-    aligned_free(static_cast<void *>(ptr));
-}
-
 #endif
 
 #endif // BASE_H
