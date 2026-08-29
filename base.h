@@ -34,12 +34,16 @@ typedef ptrdiff_t isize;
 // ---------------------- Компилятор ----------------------
 #if defined(__clang__)
 #define COMPILER_CLANG 1
+#define THIS_COMPILER "clang" 
 #elif defined(__GNUC__)
 #define COMPILER_GCC 1
+#define THIS_COMPILER "gcc" 
 #elif defined(_MSC_VER)
 #define COMPILER_MSVC 1
+#define THIS_COMPILER "msvc" 
 #else
 #define COMPILER_UNKNOWN 1
+#define THIS_COMPILER "unknown" 
 #endif
 
 // ---------------------- Inline / Force inline ----------------------
@@ -50,7 +54,6 @@ typedef ptrdiff_t isize;
 #else
 #define FORCE_INLINE inline
 #endif
-#define INLINE inline
 
 // ---------------------- Noreturn ----------------------
 #ifdef _MSC_VER
@@ -302,40 +305,5 @@ FORCE_INLINE int atomic_cas(volatile int *a, int expected, int desired) {
     return expected;
 }
 #endif
-
-typedef struct {
-    void *(*alloc)(void *ctx, size_t size);
-    void (*free)(void *ctx, void *ptr);
-    void (*reset)(void *ctx);
-} Allocator;
-
-typedef struct {
-    Allocator *api; // Твоя структура с функциями
-    void *data;     // Сама арена или NULL для malloc
-} Context;
-
-static void *std_alloc_impl(void *ctx, size_t size) {
-    (void)ctx; // Контекст не нужен для malloc
-    return malloc(size);
-}
-
-static void std_free_impl(void *ctx, void *ptr) {
-    (void)ctx;
-    free(ptr);
-}
-
-static void std_reset_impl(void *ctx) {
-    (void)ctx;
-}
-
-static const Allocator STD_ALLOCATOR_API = {
-    .alloc = std_alloc_impl, .free = std_free_impl, .reset = std_reset_impl};
-
-const Context STD_CONTEXT = {.api = (Allocator *)&STD_ALLOCATOR_API,
-                             .data = NULL};
-
-#define BALLOC(a, ctx, sz) ((a).alloc((ctx), (sz)))
-#define BFREE(a, ctx, ptr) ((a).free((ctx), (ptr)))
-#define BRESET(a, ctx) ((a).reset((ctx)))
 
 #endif // BASE_H
